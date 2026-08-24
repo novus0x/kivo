@@ -1,0 +1,17 @@
+[package]
+name = "kivo"
+version = "0.1.0"
+edition = "2021"
+description = "Decentralized P2P messaging application"
+
+[dependencies]
+rust-argon2 = "3"
+rand = "0.10"
+rpassword = "7"
+rusqlite = { version = "0.40", features = ["bundled"] }
+dirs = "6"
+zeroize = { version = "1", features = ["derive"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+chacha20poly1305 = "0.11"
+sha2 = "0.11"
+hex = "0.4"
