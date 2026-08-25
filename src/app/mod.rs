@@ -2,13 +2,14 @@ use ed25519_dalek::SigningKey;
 
 use crate::core::crypto;
 use crate::core::identity::Identity;
-use crate::network::node::Node;
+use crate::network::node::NetworkNode;
 use crate::storage::local::LocalStore;
 
 pub struct KivoApp {
-    pub node: Node,
+    pub identity: Identity,
     pub store: LocalStore,
     pub signing_key: Option<SigningKey>,
+    pub network: NetworkNode,
 }
 
 impl KivoApp {
@@ -17,20 +18,12 @@ impl KivoApp {
         signing_key: SigningKey,
         store: LocalStore,
     ) -> Self {
-        let node = Node::new(identity);
         KivoApp {
-            node,
+            identity,
             store,
             signing_key: Some(signing_key),
+            network: NetworkNode::new(),
         }
-    }
-
-    pub fn start(&mut self) {
-        self.node.start();
-    }
-
-    pub fn stop(&mut self) {
-        self.node.stop();
     }
 
     pub fn verify_current_password(&self, password: &str) -> Result<(), String> {
@@ -38,15 +31,35 @@ impl KivoApp {
     }
 
     pub fn reset_identity(&mut self, new_username: &str, new_password: &str) -> Result<(), String> {
+        if self.network.is_online() {
+            self.network
+                .stop()
+                .map_err(|e| format!("Cannot reset identity while network is running: {e}"))?;
+        }
+
         let kp = crypto::generate_keypair();
         let new_identity = Identity::new(new_username, kp.verifying_key.to_bytes().to_vec());
 
         self.store
             .replace_identity(&new_identity, &kp.signing_key, new_password)?;
 
-        self.node.identity = new_identity;
+        self.identity = new_identity;
         self.signing_key = Some(kp.signing_key);
+        self.network.reset();
 
         Ok(())
+    }
+
+    pub fn network_start(&mut self) -> Result<(), String> {
+        let signing_key = self
+            .signing_key
+            .as_ref()
+            .ok_or("No signing key available.".to_string())?;
+
+        self.network.start(&self.identity, &signing_key.to_bytes())
+    }
+
+    pub fn network_stop(&mut self) -> Result<(), String> {
+        self.network.stop()
     }
 }

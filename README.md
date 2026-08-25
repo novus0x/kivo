@@ -23,17 +23,23 @@ Implemented:
 * One-shot CLI commands
 * Isolated in-memory databases for tests
 * Basic node, peer, message, and contact structures
+* Local libp2p P2P node with QUIC transport
+* Ed25519 identity reused for libp2p PeerId
+* Background network event loop (tokio)
+* `network start` / `network stop` / `network status` commands
+* Identity reset with automatic network shutdown
 
 Not implemented yet:
 
 * Contact exchange and verification
-* Real peer-to-peer networking
-* Message encryption
 * Peer discovery
+* Direct peer connection
+* Message encryption
 * DHT
 * NAT traversal
 * Hole punching
 * Relay support
+* IP anonymity
 * Mobile clients
 * Desktop GUI
 * Group messaging
@@ -123,6 +129,22 @@ The plaintext password is never stored.
 
 The SQLite database itself is not encrypted yet.
 
+## Networking
+
+Kivo can start a local libp2p P2P node using QUIC as the transport protocol.
+
+The network node reuses the existing Ed25519 identity — no second keypair is generated. The libp2p PeerId is deterministically derived from the same public key used for the Kivo ID.
+
+The network does not start automatically. Use `network start` to bring it online, `network status` to check state, and `network stop` to shut it down cleanly.
+
+Current limitations:
+
+* peer discovery is not implemented
+* direct peer connection is not implemented in the user-facing workflow yet
+* IP addresses are not published as part of Kivo identity
+* no addresses are stored in SQLite
+* no anonymity or encryption of metadata yet
+
 ## Storage
 
 Kivo currently stores its local state at:
@@ -198,6 +220,9 @@ The interactive shell currently supports:
 help
 status
 identity
+network start
+network stop
+network status
 reset identity
 version
 exit
@@ -218,10 +243,31 @@ kivo> status
 
 Kivo status
 
-Node: running
 Identity: novus
+Identity ID: kivo:a1b2c3d4...
 Storage: persistent
-Network: not implemented
+Network: offline
+
+kivo> network start
+
+Starting Kivo network...
+
+Network: online
+Identity: kivo:a1b2c3d4...
+Transport: QUIC
+Peer ID: 12D3KooW...
+
+kivo> network status
+
+Network: online
+Identity: kivo:a1b2c3d4...
+Transport: QUIC
+Connections: 0
+Peer ID: 12D3KooW...
+
+kivo> network stop
+
+Network stopped.
 
 kivo> exit
 
@@ -236,7 +282,7 @@ cargo run -- version
 cargo run -- help
 ```
 
-The `reset identity` command permanently deletes the current identity and all local data associated with it, then creates a new identity from scratch. It requires the current password and an explicit `RESET` confirmation. The replacement is transactional — if anything fails, the existing identity remains intact.
+The `reset identity` command permanently deletes the current identity and all local data associated with it, then creates a new identity from scratch. It requires the current password and an explicit `RESET` confirmation. The replacement is transactional — if anything fails, the existing identity remains intact. If the network is running, it is stopped before the reset.
 
 ## Architecture
 

@@ -22,8 +22,6 @@ fn interactive() {
 
     let store = LocalStore::open().expect("Failed to open database");
 
-    // Check for legacy schema before proceeding.
-
     if store.is_legacy_schema() {
         eprintln!("Legacy development identity detected.");
         eprintln!("This version requires a new cryptographic identity.");
@@ -75,7 +73,7 @@ fn interactive() {
         KivoApp::new_with_identity(identity, kp.signing_key, store)
     };
 
-    app.start();
+    println!("Network: offline\n");
     println!("Kivo ready.\n");
     shell(&mut app);
 }
@@ -129,7 +127,25 @@ fn dispatch(input: &str, app: &mut KivoApp) -> bool {
             reset_identity(app);
             false
         }
+        "network start" => {
+            network_start(app);
+            false
+        }
+        "network stop" => {
+            network_stop(app);
+            false
+        }
+        "network status" => {
+            network_status(app);
+            false
+        }
         "exit" | "quit" => {
+            if app.network.is_online() {
+                println!("Stopping network...");
+                if app.network_stop().is_ok() {
+                    println!("Network stopped.");
+                }
+            }
             println!("Goodbye.");
             true
         }
@@ -165,6 +181,9 @@ fn shell_help() {
     println!("  help            Show available commands");
     println!("  status          Show node and identity status");
     println!("  identity        Show current identity");
+    println!("  network start   Start the local P2P node");
+    println!("  network stop    Stop the local P2P node");
+    println!("  network status  Show network status");
     println!("  reset identity  Permanently delete the current identity and start over");
     println!("  version         Show version information");
     println!("  exit            Exit Kivo");
@@ -223,32 +242,75 @@ fn passwords_match(a: &str, b: &str) -> bool {
 
 fn status(app: &KivoApp) {
     println!("\nKivo status\n");
-    println!(
-        "Node: {}",
-        if app.node.is_running {
-            "running"
-        } else {
-            "stopped"
-        }
-    );
-    println!("Identity: {}", app.node.identity.name);
-    println!("Identity ID: {}", app.node.identity.id);
+    println!("Identity: {}", app.identity.name);
+    println!("Identity ID: {}", app.identity.id);
     println!("Storage: persistent");
-    println!("Network: not implemented\n");
+    let net = if app.network.is_online() {
+        "online"
+    } else {
+        "offline"
+    };
+    println!("Network: {net}\n");
 }
 
 fn identity(app: &KivoApp) {
-    println!("\nUsername: {}", app.node.identity.name);
-    println!("ID: {}", app.node.identity.id);
-    println!("Public key: {}", hex::encode(&app.node.identity.public_key));
-    println!("Fingerprint: {}\n", app.node.identity.fingerprint());
+    println!("\nUsername: {}", app.identity.name);
+    println!("ID: {}", app.identity.id);
+    println!("Public key: {}", hex::encode(&app.identity.public_key));
+    println!("Fingerprint: {}\n", app.identity.fingerprint());
+}
+
+fn network_start(app: &mut KivoApp) {
+    println!("Starting Kivo network...\n");
+
+    match app.network_start() {
+        Ok(()) => {
+            println!("Network: online");
+            println!("Identity: {}", app.identity.id);
+            println!("Transport: QUIC");
+            if let Some(pid) = app.network.peer_id() {
+                println!("Peer ID: {pid}");
+            }
+            println!();
+        }
+        Err(e) => {
+            eprintln!("{e}\n");
+        }
+    }
+}
+
+fn network_stop(app: &mut KivoApp) {
+    match app.network_stop() {
+        Ok(()) => {
+            println!("Network stopped.\n");
+        }
+        Err(e) => {
+            eprintln!("{e}\n");
+        }
+    }
+}
+
+fn network_status(app: &KivoApp) {
+    println!();
+    if app.network.is_online() {
+        println!("Network: online");
+        println!("Identity: {}", app.identity.id);
+        println!("Transport: QUIC");
+        println!("Connections: {}", app.network.connection_count());
+        if let Some(pid) = app.network.peer_id() {
+            println!("Peer ID: {pid}");
+        }
+    } else {
+        println!("Network: offline");
+    }
+    println!();
 }
 
 fn reset_identity(app: &mut KivoApp) {
     println!("This will permanently delete your current identity and all local data.\n");
     println!("Current identity:");
-    println!("Username: {}", app.node.identity.name);
-    println!("ID: {}\n", app.node.identity.id);
+    println!("Username: {}", app.identity.name);
+    println!("ID: {}\n", app.identity.id);
 
     let password = prompt_password_custom("Current password: ");
 
@@ -277,8 +339,9 @@ fn reset_identity(app: &mut KivoApp) {
     match app.reset_identity(&username, &password) {
         Ok(()) => {
             println!("\nIdentity reset successfully.\n");
-            println!("Username: {}", app.node.identity.name);
-            println!("ID: {}\n", app.node.identity.id);
+            println!("Username: {}", app.identity.name);
+            println!("ID: {}\n", app.identity.id);
+            println!("Network: offline\n");
         }
         Err(_) => {
             eprintln!("\nUnable to reset identity.");
@@ -356,14 +419,26 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_network_stop() {
+        let mut app = create_test_app("test");
+        assert!(!dispatch("network stop", &mut app));
+    }
+
+    #[test]
+    fn dispatch_network_status() {
+        let mut app = create_test_app("test");
+        assert!(!dispatch("network status", &mut app));
+    }
+
+    #[test]
     fn identity_persists_during_session() {
         let mut app = create_test_app("alice");
-        let id = app.node.identity.id.clone();
+        let id = app.identity.id.clone();
 
         dispatch("identity", &mut app);
         dispatch("status", &mut app);
-        assert_eq!(app.node.identity.id, id);
-        assert_eq!(app.node.identity.name, "alice");
+        assert_eq!(app.identity.id, id);
+        assert_eq!(app.identity.name, "alice");
     }
 
     #[test]
@@ -405,41 +480,51 @@ mod tests {
     #[test]
     fn reset_identity_works() {
         let mut app = create_test_app("old");
-        let old_id = app.node.identity.id.clone();
+        let old_id = app.identity.id.clone();
 
         app.reset_identity("new", "newpass").unwrap();
 
-        assert_eq!(app.node.identity.name, "new");
-        assert_ne!(app.node.identity.id, old_id);
+        assert_eq!(app.identity.name, "new");
+        assert_ne!(app.identity.id, old_id);
         assert!(app.verify_current_password("newpass").is_ok());
     }
 
     #[test]
     fn reset_identity_new_id_different() {
         let mut app = create_test_app("old");
-        let old_id = app.node.identity.id.clone();
-        let old_pubkey = app.node.identity.public_key.clone();
+        let old_id = app.identity.id.clone();
+        let old_pubkey = app.identity.public_key.clone();
 
         app.reset_identity("new", "newpass").unwrap();
 
-        assert_ne!(app.node.identity.id, old_id);
-        assert_ne!(app.node.identity.public_key, old_pubkey);
+        assert_ne!(app.identity.id, old_id);
+        assert_ne!(app.identity.public_key, old_pubkey);
     }
 
     #[test]
     fn reset_identity_persists_after_reopen() {
-        // Persistence is tested at the storage level (replace_identity_persists).
-        // Here we verify the full flow through the app layer.
         let mut app = create_test_app("old");
-        let old_id = app.node.identity.id.clone();
-        let old_pubkey = app.node.identity.public_key.clone();
+        let old_id = app.identity.id.clone();
+        let old_pubkey = app.identity.public_key.clone();
 
         app.reset_identity("new", "newpass").unwrap();
 
-        assert_eq!(app.node.identity.name, "new");
-        assert_ne!(app.node.identity.id, old_id);
-        assert_ne!(app.node.identity.public_key, old_pubkey);
+        assert_eq!(app.identity.name, "new");
+        assert_ne!(app.identity.id, old_id);
+        assert_ne!(app.identity.public_key, old_pubkey);
         assert!(app.verify_current_password("newpass").is_ok());
         assert!(app.verify_current_password("oldpass").is_err());
+    }
+
+    #[test]
+    fn network_initially_offline() {
+        let app = create_test_app("test");
+        assert!(!app.network.is_online());
+    }
+
+    #[test]
+    fn network_stop_when_offline_fails() {
+        let mut app = create_test_app("test");
+        assert!(app.network_stop().is_err());
     }
 }
