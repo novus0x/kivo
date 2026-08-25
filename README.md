@@ -198,6 +198,7 @@ The interactive shell currently supports:
 help
 status
 identity
+reset identity
 version
 exit
 quit
@@ -234,6 +235,8 @@ cargo run -- status
 cargo run -- version
 cargo run -- help
 ```
+
+The `reset identity` command permanently deletes the current identity and all local data associated with it, then creates a new identity from scratch. It requires the current password and an explicit `RESET` confirmation. The replacement is transactional — if anything fails, the existing identity remains intact.
 
 ## Architecture
 

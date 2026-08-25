@@ -40,28 +40,37 @@ impl LocalStore {
         signing_key: &SigningKey,
         password: &str,
     ) -> Result<(), String> {
-        let password_salt = crypto::generate_salt();
-        let password_hash = crypto::hash_password_argon2(password, &password_salt)?;
+        insert_identity(&self.conn, identity, signing_key, password)
+    }
 
-        let enc_key = crypto::derive_encryption_key(password, &password_salt);
-        let privkey_bytes = signing_key.to_bytes();
-        let (encrypted_privkey, nonce) = crypto::encrypt_private_key(&privkey_bytes, &enc_key)?;
-
-        self.conn
-            .execute(
-                "INSERT INTO identity (id, identity_id, username, public_key, encrypted_private_key, private_key_nonce, password_hash, encryption_salt) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    identity.id,
-                    identity.name,
-                    identity.public_key,
-                    encrypted_privkey,
-                    nonce,
-                    password_hash,
-                    password_salt,
-                ],
+    pub fn verify_password(&self, password: &str) -> Result<(), String> {
+        let password_hash: String = self
+            .conn
+            .query_row(
+                "SELECT password_hash FROM identity WHERE id = 1",
+                [],
+                |row| row.get(0),
             )
+            .map_err(|_| "No identity found.".to_string())?;
+
+        if crypto::verify_password_argon2(password, &password_hash) {
+            Ok(())
+        } else {
+            Err("Invalid password.".to_string())
+        }
+    }
+
+    pub fn replace_identity(
+        &mut self,
+        new_identity: &Identity,
+        new_signing_key: &SigningKey,
+        new_password: &str,
+    ) -> Result<(), String> {
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM identity WHERE id = 1", [])
             .map_err(|e| e.to_string())?;
-        Ok(())
+        insert_identity(&tx, new_identity, new_signing_key, new_password)?;
+        tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn load_public_identity(&self) -> Option<Identity> {
@@ -153,6 +162,34 @@ impl LocalStore {
 pub struct UnlockedIdentity {
     pub identity: Identity,
     pub signing_key: SigningKey,
+}
+
+fn insert_identity(
+    conn: &Connection,
+    identity: &Identity,
+    signing_key: &SigningKey,
+    password: &str,
+) -> Result<(), String> {
+    let password_salt = crypto::generate_salt();
+    let password_hash = crypto::hash_password_argon2(password, &password_salt)?;
+    let enc_key = crypto::derive_encryption_key(password, &password_salt);
+    let privkey_bytes = signing_key.to_bytes();
+    let (encrypted_privkey, nonce) = crypto::encrypt_private_key(&privkey_bytes, &enc_key)?;
+
+    conn.execute(
+        "INSERT INTO identity (id, identity_id, username, public_key, encrypted_private_key, private_key_nonce, password_hash, encryption_salt) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            identity.id,
+            identity.name,
+            identity.public_key,
+            encrypted_privkey,
+            nonce,
+            password_hash,
+            password_salt,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn kivo_db_path() -> Result<PathBuf, String> {
@@ -366,5 +403,124 @@ mod tests {
         ).unwrap();
 
         assert!(store.is_legacy_schema());
+    }
+
+    #[test]
+    fn verify_password_correct() {
+        let store = test_store();
+        let (identity, signing_key) = create_test_identity("alice");
+        store
+            .save_new_identity(&identity, &signing_key, "pass123")
+            .unwrap();
+        assert!(store.verify_password("pass123").is_ok());
+    }
+
+    #[test]
+    fn verify_password_wrong() {
+        let store = test_store();
+        let (identity, signing_key) = create_test_identity("alice");
+        store
+            .save_new_identity(&identity, &signing_key, "pass123")
+            .unwrap();
+        assert!(store.verify_password("wrong").is_err());
+    }
+
+    #[test]
+    fn verify_password_no_identity() {
+        let store = test_store();
+        assert!(store.verify_password("anything").is_err());
+    }
+
+    #[test]
+    fn replace_identity_works() {
+        let mut store = test_store();
+        let (old_identity, old_key) = create_test_identity("old");
+        store
+            .save_new_identity(&old_identity, &old_key, "oldpass")
+            .unwrap();
+
+        let (new_identity, new_key) = create_test_identity("new");
+        store
+            .replace_identity(&new_identity, &new_key, "newpass")
+            .unwrap();
+
+        let loaded = store.load_public_identity().unwrap();
+        assert_eq!(loaded.name, "new");
+        assert_eq!(loaded.id, new_identity.id);
+        assert!(store.verify_password("newpass").is_ok());
+        assert!(store.verify_password("oldpass").is_err());
+    }
+
+    #[test]
+    fn replace_identity_old_password_fails() {
+        let mut store = test_store();
+        let (old_identity, old_key) = create_test_identity("old");
+        store
+            .save_new_identity(&old_identity, &old_key, "oldpass")
+            .unwrap();
+
+        let (new_identity, new_key) = create_test_identity("new");
+        store
+            .replace_identity(&new_identity, &new_key, "newpass")
+            .unwrap();
+
+        assert!(store.unlock_with_password("oldpass").is_err());
+        assert!(store.unlock_with_password("newpass").is_ok());
+    }
+
+    #[test]
+    fn replace_identity_different_kivo_id() {
+        let mut store = test_store();
+        let (old_identity, old_key) = create_test_identity("old");
+        store
+            .save_new_identity(&old_identity, &old_key, "oldpass")
+            .unwrap();
+
+        let (new_identity, new_key) = create_test_identity("new");
+        store
+            .replace_identity(&new_identity, &new_key, "newpass")
+            .unwrap();
+
+        assert_ne!(old_identity.id, new_identity.id);
+        assert_ne!(old_identity.public_key, new_identity.public_key);
+    }
+
+    #[test]
+    fn replace_identity_persists() {
+        let dir = std::env::temp_dir().join("kivo_test_replace_persist");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("test.db");
+
+        let (old_identity, old_key) = create_test_identity("old");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            init_schema(&conn).unwrap();
+            let store = LocalStore { conn };
+            store
+                .save_new_identity(&old_identity, &old_key, "oldpass")
+                .unwrap();
+        }
+
+        let (new_identity, new_key) = create_test_identity("new");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let mut store = LocalStore { conn };
+            store
+                .replace_identity(&new_identity, &new_key, "newpass")
+                .unwrap();
+        }
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let store = LocalStore { conn };
+            let loaded = store.load_public_identity().unwrap();
+            assert_eq!(loaded.name, "new");
+            assert_eq!(loaded.id, new_identity.id);
+            assert!(store.unlock_with_password("newpass").is_ok());
+            assert!(store.unlock_with_password("oldpass").is_err());
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

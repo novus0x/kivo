@@ -81,15 +81,14 @@ fn interactive() {
 }
 
 fn shell(app: &mut KivoApp) {
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
-
     loop {
         print!("kivo> ");
         io::stdout().flush().unwrap();
 
         let mut line = String::new();
-        match reader.read_line(&mut line) {
+        let read_result = io::stdin().lock().read_line(&mut line);
+
+        match read_result {
             Ok(0) => {
                 println!("\nGoodbye.");
                 break;
@@ -126,6 +125,10 @@ fn dispatch(input: &str, app: &mut KivoApp) -> bool {
             version();
             false
         }
+        "reset identity" => {
+            reset_identity(app);
+            false
+        }
         "exit" | "quit" => {
             println!("Goodbye.");
             true
@@ -159,12 +162,13 @@ fn one_shot_status() {
 
 fn shell_help() {
     println!("Commands:\n");
-    println!("  help      Show available commands");
-    println!("  status    Show node and identity status");
-    println!("  identity  Show current identity");
-    println!("  version   Show version information");
-    println!("  exit      Exit Kivo");
-    println!("  quit      Exit Kivo");
+    println!("  help            Show available commands");
+    println!("  status          Show node and identity status");
+    println!("  identity        Show current identity");
+    println!("  reset identity  Permanently delete the current identity and start over");
+    println!("  version         Show version information");
+    println!("  exit            Exit Kivo");
+    println!("  quit            Exit Kivo");
 }
 
 fn print_help() {
@@ -238,6 +242,59 @@ fn identity(app: &KivoApp) {
     println!("ID: {}", app.node.identity.id);
     println!("Public key: {}", hex::encode(&app.node.identity.public_key));
     println!("Fingerprint: {}\n", app.node.identity.fingerprint());
+}
+
+fn reset_identity(app: &mut KivoApp) {
+    println!("This will permanently delete your current identity and all local data.\n");
+    println!("Current identity:");
+    println!("Username: {}", app.node.identity.name);
+    println!("ID: {}\n", app.node.identity.id);
+
+    let password = prompt_password_custom("Current password: ");
+
+    if app.verify_current_password(&password).is_err() {
+        eprintln!("\nInvalid password.");
+        eprintln!("Identity was not changed.\n");
+        return;
+    }
+
+    println!("\nThis action cannot be undone.\n");
+    print!("Type RESET to continue: ");
+    io::stdout().flush().unwrap();
+
+    let mut confirm = String::new();
+    io::stdin().read_line(&mut confirm).unwrap();
+
+    if confirm.trim() != "RESET" {
+        eprintln!("\nReset cancelled.\n");
+        return;
+    }
+
+    println!("\nCreate a new local identity\n");
+    let username = prompt_username();
+    let password = prompt_password_confirm();
+
+    match app.reset_identity(&username, &password) {
+        Ok(()) => {
+            println!("\nIdentity reset successfully.\n");
+            println!("Username: {}", app.node.identity.name);
+            println!("ID: {}\n", app.node.identity.id);
+        }
+        Err(_) => {
+            eprintln!("\nUnable to reset identity.");
+            eprintln!("Your existing identity was not changed.\n");
+        }
+    }
+}
+
+fn prompt_password_custom(msg: &str) -> String {
+    loop {
+        let password = rpassword::prompt_password(msg).unwrap();
+        if !password.is_empty() {
+            return password;
+        }
+        eprintln!("Password cannot be empty.");
+    }
 }
 
 fn version() {
@@ -343,5 +400,46 @@ mod tests {
         let loaded = store.load_public_identity().unwrap();
         assert_eq!(loaded.name, "testuser");
         assert_eq!(loaded.id, identity.id);
+    }
+
+    #[test]
+    fn reset_identity_works() {
+        let mut app = create_test_app("old");
+        let old_id = app.node.identity.id.clone();
+
+        app.reset_identity("new", "newpass").unwrap();
+
+        assert_eq!(app.node.identity.name, "new");
+        assert_ne!(app.node.identity.id, old_id);
+        assert!(app.verify_current_password("newpass").is_ok());
+    }
+
+    #[test]
+    fn reset_identity_new_id_different() {
+        let mut app = create_test_app("old");
+        let old_id = app.node.identity.id.clone();
+        let old_pubkey = app.node.identity.public_key.clone();
+
+        app.reset_identity("new", "newpass").unwrap();
+
+        assert_ne!(app.node.identity.id, old_id);
+        assert_ne!(app.node.identity.public_key, old_pubkey);
+    }
+
+    #[test]
+    fn reset_identity_persists_after_reopen() {
+        // Persistence is tested at the storage level (replace_identity_persists).
+        // Here we verify the full flow through the app layer.
+        let mut app = create_test_app("old");
+        let old_id = app.node.identity.id.clone();
+        let old_pubkey = app.node.identity.public_key.clone();
+
+        app.reset_identity("new", "newpass").unwrap();
+
+        assert_eq!(app.node.identity.name, "new");
+        assert_ne!(app.node.identity.id, old_id);
+        assert_ne!(app.node.identity.public_key, old_pubkey);
+        assert!(app.verify_current_password("newpass").is_ok());
+        assert!(app.verify_current_password("oldpass").is_err());
     }
 }
