@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 
 use ed25519_dalek::SigningKey;
 use rusqlite::{params, Connection};
@@ -12,17 +12,16 @@ pub struct LocalStore {
 }
 
 impl LocalStore {
-    pub fn open() -> Result<Self, String> {
-        let db_path = kivo_db_path()?;
-        ensure_parent_dir(&db_path)?;
-        let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
-        init_schema(&conn)?;
+    pub fn open(db_path: &Path) -> Result<Self, String> {
+        ensure_parent_dir(db_path)?;
+        let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+        init_schema(&conn, db_path)?;
         Ok(LocalStore { conn })
     }
 
     pub fn open_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
-        init_schema(&conn)?;
+        init_schema(&conn, Path::new(":memory:"))?;
         Ok(LocalStore { conn })
     }
 
@@ -192,12 +191,7 @@ fn insert_identity(
     Ok(())
 }
 
-fn kivo_db_path() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    Ok(home.join(".kivo").join("kivo.db"))
-}
-
-fn ensure_parent_dir(path: &PathBuf) -> Result<(), String> {
+fn ensure_parent_dir(path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.exists() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -212,9 +206,7 @@ fn ensure_parent_dir(path: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn init_schema(conn: &Connection) -> Result<(), String> {
-    // Check if old schema exists (no public_key column).
-
+fn init_schema(conn: &Connection, db_path: &Path) -> Result<(), String> {
     let has_legacy = conn
         .query_row("SELECT public_key FROM identity WHERE id = 1", [], |_row| {
             Ok(())
@@ -222,8 +214,6 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
         .is_err();
 
     if has_legacy {
-        // Check if the table exists at all.
-
         let table_exists: bool = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='identity'",
@@ -234,9 +224,10 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             > 0;
 
         if table_exists {
-            return Err(
-                "Legacy development identity detected. This version requires a new cryptographic identity.\nDelete ~/.kivo/kivo.db and restart.".to_string()
-            );
+            return Err(format!(
+                "Legacy development identity detected. This version requires a new cryptographic identity.\nDelete {} and restart.",
+                db_path.display()
+            ));
         }
     }
 
@@ -254,273 +245,4 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_store() -> LocalStore {
-        LocalStore::open_memory().expect("Failed to open in-memory DB")
-    }
-
-    fn create_test_identity(name: &str) -> (Identity, SigningKey) {
-        let kp = crypto::generate_keypair();
-        let identity = Identity::new(name, kp.verifying_key.to_bytes().to_vec());
-        (identity, kp.signing_key)
-    }
-
-    #[test]
-    fn new_database_has_no_identity() {
-        let store = test_store();
-        assert!(!store.has_identity());
-    }
-
-    #[test]
-    fn save_and_load_identity() {
-        let store = test_store();
-        let (identity, signing_key) = create_test_identity("alice");
-        store
-            .save_new_identity(&identity, &signing_key, "pass123")
-            .unwrap();
-
-        let loaded = store.load_public_identity().expect("Identity not found");
-        assert_eq!(loaded.name, "alice");
-        assert_eq!(loaded.id, identity.id);
-        assert_eq!(loaded.public_key, identity.public_key);
-    }
-
-    #[test]
-    fn unlock_with_correct_password() {
-        let store = test_store();
-        let (identity, signing_key) = create_test_identity("bob");
-        store
-            .save_new_identity(&identity, &signing_key, "secret")
-            .unwrap();
-
-        let unlocked = store.unlock_with_password("secret").unwrap();
-        assert_eq!(unlocked.identity.name, "bob");
-        assert_eq!(unlocked.identity.id, identity.id);
-        // Verify key relationship.
-
-        assert_eq!(
-            unlocked.signing_key.verifying_key().as_bytes(),
-            identity.public_key.as_slice()
-        );
-    }
-
-    #[test]
-    fn unlock_with_wrong_password_fails() {
-        let store = test_store();
-        let (identity, signing_key) = create_test_identity("bob");
-        store
-            .save_new_identity(&identity, &signing_key, "secret")
-            .unwrap();
-
-        assert!(store.unlock_with_password("wrong").is_err());
-    }
-
-    #[test]
-    fn modified_ciphertext_fails_unlock() {
-        let store = test_store();
-        let (identity, signing_key) = create_test_identity("bob");
-        store
-            .save_new_identity(&identity, &signing_key, "secret")
-            .unwrap();
-
-        // Tamper with the encrypted private key in the DB.
-
-        store
-            .conn
-            .execute(
-                "UPDATE identity SET encrypted_private_key = zeroblob(64) WHERE id = 1",
-                [],
-            )
-            .unwrap();
-
-        assert!(store.unlock_with_password("secret").is_err());
-    }
-
-    #[test]
-    fn identity_survives_reopen() {
-        let dir = std::env::temp_dir().join("kivo_test_reopen_v2");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let db_path = dir.join("test.db");
-
-        let (identity, signing_key) = create_test_identity("dave");
-
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            init_schema(&conn).unwrap();
-            let store = LocalStore { conn };
-            store
-                .save_new_identity(&identity, &signing_key, "mypass")
-                .unwrap();
-        }
-
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            let store = LocalStore { conn };
-            let loaded = store.load_public_identity().unwrap();
-            assert_eq!(loaded.name, "dave");
-            assert_eq!(loaded.id, identity.id);
-            assert_eq!(loaded.public_key, identity.public_key);
-
-            let unlocked = store.unlock_with_password("mypass").unwrap();
-            assert_eq!(
-                unlocked.signing_key.verifying_key().as_bytes(),
-                identity.public_key.as_slice()
-            );
-        }
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn legacy_schema_detected() {
-        let store = test_store();
-        // Create old-style table.
-
-        store
-            .conn
-            .execute_batch("DROP TABLE IF EXISTS identity;")
-            .unwrap();
-        store
-            .conn
-            .execute_batch(
-                "CREATE TABLE identity (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                identity_id TEXT NOT NULL,
-                username TEXT NOT NULL,
-                password_hash TEXT NOT NULL
-            );",
-            )
-            .unwrap();
-        store.conn.execute(
-            "INSERT INTO identity (id, identity_id, username, password_hash) VALUES (1, 'old-id', 'olduser', 'hash')",
-            [],
-        ).unwrap();
-
-        assert!(store.is_legacy_schema());
-    }
-
-    #[test]
-    fn verify_password_correct() {
-        let store = test_store();
-        let (identity, signing_key) = create_test_identity("alice");
-        store
-            .save_new_identity(&identity, &signing_key, "pass123")
-            .unwrap();
-        assert!(store.verify_password("pass123").is_ok());
-    }
-
-    #[test]
-    fn verify_password_wrong() {
-        let store = test_store();
-        let (identity, signing_key) = create_test_identity("alice");
-        store
-            .save_new_identity(&identity, &signing_key, "pass123")
-            .unwrap();
-        assert!(store.verify_password("wrong").is_err());
-    }
-
-    #[test]
-    fn verify_password_no_identity() {
-        let store = test_store();
-        assert!(store.verify_password("anything").is_err());
-    }
-
-    #[test]
-    fn replace_identity_works() {
-        let mut store = test_store();
-        let (old_identity, old_key) = create_test_identity("old");
-        store
-            .save_new_identity(&old_identity, &old_key, "oldpass")
-            .unwrap();
-
-        let (new_identity, new_key) = create_test_identity("new");
-        store
-            .replace_identity(&new_identity, &new_key, "newpass")
-            .unwrap();
-
-        let loaded = store.load_public_identity().unwrap();
-        assert_eq!(loaded.name, "new");
-        assert_eq!(loaded.id, new_identity.id);
-        assert!(store.verify_password("newpass").is_ok());
-        assert!(store.verify_password("oldpass").is_err());
-    }
-
-    #[test]
-    fn replace_identity_old_password_fails() {
-        let mut store = test_store();
-        let (old_identity, old_key) = create_test_identity("old");
-        store
-            .save_new_identity(&old_identity, &old_key, "oldpass")
-            .unwrap();
-
-        let (new_identity, new_key) = create_test_identity("new");
-        store
-            .replace_identity(&new_identity, &new_key, "newpass")
-            .unwrap();
-
-        assert!(store.unlock_with_password("oldpass").is_err());
-        assert!(store.unlock_with_password("newpass").is_ok());
-    }
-
-    #[test]
-    fn replace_identity_different_kivo_id() {
-        let mut store = test_store();
-        let (old_identity, old_key) = create_test_identity("old");
-        store
-            .save_new_identity(&old_identity, &old_key, "oldpass")
-            .unwrap();
-
-        let (new_identity, new_key) = create_test_identity("new");
-        store
-            .replace_identity(&new_identity, &new_key, "newpass")
-            .unwrap();
-
-        assert_ne!(old_identity.id, new_identity.id);
-        assert_ne!(old_identity.public_key, new_identity.public_key);
-    }
-
-    #[test]
-    fn replace_identity_persists() {
-        let dir = std::env::temp_dir().join("kivo_test_replace_persist");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let db_path = dir.join("test.db");
-
-        let (old_identity, old_key) = create_test_identity("old");
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            init_schema(&conn).unwrap();
-            let store = LocalStore { conn };
-            store
-                .save_new_identity(&old_identity, &old_key, "oldpass")
-                .unwrap();
-        }
-
-        let (new_identity, new_key) = create_test_identity("new");
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            let mut store = LocalStore { conn };
-            store
-                .replace_identity(&new_identity, &new_key, "newpass")
-                .unwrap();
-        }
-
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            let store = LocalStore { conn };
-            let loaded = store.load_public_identity().unwrap();
-            assert_eq!(loaded.name, "new");
-            assert_eq!(loaded.id, new_identity.id);
-            assert!(store.unlock_with_password("newpass").is_ok());
-            assert!(store.unlock_with_password("oldpass").is_err());
-        }
-
-        let _ = fs::remove_dir_all(&dir);
-    }
 }

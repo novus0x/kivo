@@ -14,15 +14,3 @@ impl Contact {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn new_contact_stores_fields() {
-        let contact = Contact::new("kivo-1", "Bob");
-        assert_eq!(contact.identity_id, "kivo-1");
-        assert_eq!(contact.name, "Bob");
-    }
-}

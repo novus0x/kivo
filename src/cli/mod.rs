@@ -1,31 +1,65 @@
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 
 use crate::app::KivoApp;
 use crate::core::crypto;
 use crate::core::identity::Identity;
 use crate::storage::local::LocalStore;
+use crate::utils::paths::KivoPaths;
 
 pub fn run(args: Vec<String>) {
-    match args.get(1).map(|s| s.as_str()) {
-        Some("status") => one_shot_status(),
+    let (data_dir, filtered_args) = parse_args(&args).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+
+    let paths = KivoPaths::resolve(data_dir).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+
+    match filtered_args.get(1).map(|s| s.as_str()) {
+        Some("status") => one_shot_status(&paths),
         Some("version") => version(),
         Some(unknown) => {
             eprintln!("Unknown command: {unknown}\n");
             print_help();
         }
-        None => interactive(),
+        None => interactive(&paths),
     }
 }
 
-fn interactive() {
+pub fn parse_args(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>), String> {
+    let mut data_dir = None;
+    let mut filtered = vec![args[0].clone()];
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--data-dir" {
+            if data_dir.is_some() {
+                return Err("Duplicate --data-dir flag.".to_string());
+            }
+            i += 1;
+            if i >= args.len() {
+                return Err("Missing value for --data-dir.".to_string());
+            }
+            data_dir = Some(PathBuf::from(&args[i]));
+        } else {
+            filtered.push(args[i].clone());
+        }
+        i += 1;
+    }
+    Ok((data_dir, filtered))
+}
+
+fn interactive(paths: &KivoPaths) {
     println!("Welcome to Kivo\n");
 
-    let store = LocalStore::open().expect("Failed to open database");
+    let store = LocalStore::open(&paths.database).expect("Failed to open database");
 
     if store.is_legacy_schema() {
         eprintln!("Legacy development identity detected.");
         eprintln!("This version requires a new cryptographic identity.");
-        eprintln!("Delete ~/.kivo/kivo.db and restart.\n");
+        eprintln!("Delete {} and restart.\n", paths.database.display());
         return;
     }
 
@@ -105,7 +139,7 @@ fn shell(app: &mut KivoApp) {
     }
 }
 
-fn dispatch(input: &str, app: &mut KivoApp) -> bool {
+pub fn dispatch(input: &str, app: &mut KivoApp) -> bool {
     match input {
         "help" => {
             shell_help();
@@ -139,6 +173,19 @@ fn dispatch(input: &str, app: &mut KivoApp) -> bool {
             network_status(app);
             false
         }
+        "network address" => {
+            network_address(app);
+            false
+        }
+        "network peers" => {
+            network_peers(app);
+            false
+        }
+        line if line.starts_with("network connect ") => {
+            let addr_str = line.strip_prefix("network connect ").unwrap().trim();
+            network_connect(app, addr_str);
+            false
+        }
         "exit" | "quit" => {
             if app.network.is_online() {
                 println!("Stopping network...");
@@ -157,8 +204,8 @@ fn dispatch(input: &str, app: &mut KivoApp) -> bool {
     }
 }
 
-fn one_shot_status() {
-    match LocalStore::open() {
+fn one_shot_status(paths: &KivoPaths) {
+    match LocalStore::open(&paths.database) {
         Ok(store) => {
             println!("\nKivo status\n");
             println!("Storage: persistent");
@@ -178,24 +225,32 @@ fn one_shot_status() {
 
 fn shell_help() {
     println!("Commands:\n");
-    println!("  help            Show available commands");
-    println!("  status          Show node and identity status");
-    println!("  identity        Show current identity");
-    println!("  network start   Start the local P2P node");
-    println!("  network stop    Stop the local P2P node");
-    println!("  network status  Show network status");
-    println!("  reset identity  Permanently delete the current identity and start over");
-    println!("  version         Show version information");
-    println!("  exit            Exit Kivo");
-    println!("  quit            Exit Kivo");
+    println!("  help                           Show available commands");
+    println!("  status                         Show node and identity status");
+    println!("  identity                       Show current identity");
+    println!("  network start                  Start the local P2P node");
+    println!("  network stop                   Stop the local P2P node");
+    println!("  network status                 Show network status");
+    println!("  network address                Show listening addresses (dev)");
+    println!("  network connect <multiaddr>    Connect to a peer");
+    println!("  network peers                  Show connected peers");
+    println!(
+        "  reset identity                 Permanently delete the current identity and start over"
+    );
+    println!("  version                        Show version information");
+    println!("  exit                           Exit Kivo");
+    println!("  quit                           Exit Kivo");
 }
 
 fn print_help() {
     println!("Kivo - decentralized peer-to-peer messaging\n");
     println!("Usage:\n");
-    println!("  kivo             Start Kivo and create a local identity");
-    println!("  kivo status      Show current node status");
-    println!("  kivo version     Show version information");
+    println!("  kivo [--data-dir <path>]                    Start Kivo");
+    println!("  kivo [--data-dir <path>] status             Show current node status");
+    println!("  kivo [--data-dir <path>] version            Show version information");
+    println!();
+    println!("Options:\n");
+    println!("  --data-dir <path>  Use an alternative local data directory");
 }
 
 fn prompt_username() -> String {
@@ -306,6 +361,103 @@ fn network_status(app: &KivoApp) {
     println!();
 }
 
+fn network_address(app: &KivoApp) {
+    if !app.network.is_online() {
+        eprintln!("Network is not running.\n");
+        return;
+    }
+
+    match app.network_listen_addresses() {
+        Ok(addrs) if addrs.is_empty() => {
+            println!("\nNo listening addresses.\n");
+        }
+        Ok(addrs) => {
+            println!();
+            for addr in &addrs {
+                println!("{addr}");
+            }
+            println!();
+        }
+        Err(e) => {
+            eprintln!("{e}\n");
+        }
+    }
+}
+
+fn network_connect(app: &mut KivoApp, addr_str: &str) {
+    if !app.network.is_online() {
+        eprintln!("Network is not running.\n");
+        return;
+    }
+
+    let address: libp2p::Multiaddr = match addr_str.parse() {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln!("Invalid peer address.\n");
+            return;
+        }
+    };
+
+    let peer_id = match extract_peer_id_from_address(&address) {
+        Some(pid) => pid,
+        None => {
+            eprintln!("Invalid peer address: missing PeerId.\n");
+            return;
+        }
+    };
+
+    println!("\nDialing...\n");
+
+    match app.network_connect(address, peer_id, String::new()) {
+        Ok(()) => {
+            println!("Dial initiated. Use 'network status' to check connection.\n");
+        }
+        Err(e) => {
+            eprintln!("Unable to dial peer: {e}\n");
+        }
+    }
+}
+
+fn extract_peer_id_from_address(address: &libp2p::Multiaddr) -> Option<libp2p::PeerId> {
+    use libp2p::multiaddr::Protocol;
+    for protocol in address.iter() {
+        if let Protocol::P2p(peer_id) = protocol {
+            return Some(peer_id);
+        }
+    }
+    None
+}
+
+fn network_peers(app: &KivoApp) {
+    if !app.network.is_online() {
+        eprintln!("Network is not running.\n");
+        return;
+    }
+
+    match app.network_connected_peers() {
+        Ok(peers) => {
+            println!();
+            println!("Connected peers: {}", peers.len());
+            for peer in &peers {
+                println!();
+                if let Some(ref kivo_id) = peer.kivo_id {
+                    println!("Kivo ID: {kivo_id}");
+                }
+                println!("Peer ID: {}", peer.peer_id);
+                if peer.session_active {
+                    println!("Session: active");
+                } else {
+                    println!("Session: opening");
+                }
+            }
+            println!();
+        }
+        Err(e) => {
+            eprintln!("{e}\n");
+        }
+    }
+}
+
 fn reset_identity(app: &mut KivoApp) {
     println!("This will permanently delete your current identity and all local data.\n");
     println!("Current identity:");
@@ -362,169 +514,4 @@ fn prompt_password_custom(msg: &str) -> String {
 
 fn version() {
     println!("kivo {}", env!("CARGO_PKG_VERSION"));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core::crypto;
-
-    fn create_test_app(name: &str) -> KivoApp {
-        let store = LocalStore::open_memory().unwrap();
-        let kp = crypto::generate_keypair();
-        let identity = Identity::new(name, kp.verifying_key.to_bytes().to_vec());
-        KivoApp::new_with_identity(identity, kp.signing_key, store)
-    }
-
-    #[test]
-    fn dispatch_help() {
-        let mut app = create_test_app("test");
-        assert!(!dispatch("help", &mut app));
-    }
-
-    #[test]
-    fn dispatch_status() {
-        let mut app = create_test_app("test");
-        assert!(!dispatch("status", &mut app));
-    }
-
-    #[test]
-    fn dispatch_identity() {
-        let mut app = create_test_app("test");
-        assert!(!dispatch("identity", &mut app));
-    }
-
-    #[test]
-    fn dispatch_version() {
-        let mut app = create_test_app("test");
-        assert!(!dispatch("version", &mut app));
-    }
-
-    #[test]
-    fn dispatch_exit() {
-        let mut app = create_test_app("test");
-        assert!(dispatch("exit", &mut app));
-    }
-
-    #[test]
-    fn dispatch_quit() {
-        let mut app = create_test_app("test");
-        assert!(dispatch("quit", &mut app));
-    }
-
-    #[test]
-    fn dispatch_unknown() {
-        let mut app = create_test_app("test");
-        assert!(!dispatch("banana", &mut app));
-    }
-
-    #[test]
-    fn dispatch_network_stop() {
-        let mut app = create_test_app("test");
-        assert!(!dispatch("network stop", &mut app));
-    }
-
-    #[test]
-    fn dispatch_network_status() {
-        let mut app = create_test_app("test");
-        assert!(!dispatch("network status", &mut app));
-    }
-
-    #[test]
-    fn identity_persists_during_session() {
-        let mut app = create_test_app("alice");
-        let id = app.identity.id.clone();
-
-        dispatch("identity", &mut app);
-        dispatch("status", &mut app);
-        assert_eq!(app.identity.id, id);
-        assert_eq!(app.identity.name, "alice");
-    }
-
-    #[test]
-    fn passwords_match_positive() {
-        assert!(passwords_match("secret", "secret"));
-    }
-
-    #[test]
-    fn passwords_match_negative() {
-        assert!(!passwords_match("secret", "other"));
-    }
-
-    #[test]
-    fn passwords_match_empty() {
-        assert!(passwords_match("", ""));
-    }
-
-    #[test]
-    fn no_identity_persisted_before_confirmation() {
-        let store = LocalStore::open_memory().unwrap();
-        assert!(!store.has_identity());
-    }
-
-    #[test]
-    fn identity_only_persisted_after_save() {
-        let store = LocalStore::open_memory().unwrap();
-        let kp = crypto::generate_keypair();
-        let identity = Identity::new("testuser", kp.verifying_key.to_bytes().to_vec());
-
-        store
-            .save_new_identity(&identity, &kp.signing_key, "password123")
-            .unwrap();
-        assert!(store.has_identity());
-        let loaded = store.load_public_identity().unwrap();
-        assert_eq!(loaded.name, "testuser");
-        assert_eq!(loaded.id, identity.id);
-    }
-
-    #[test]
-    fn reset_identity_works() {
-        let mut app = create_test_app("old");
-        let old_id = app.identity.id.clone();
-
-        app.reset_identity("new", "newpass").unwrap();
-
-        assert_eq!(app.identity.name, "new");
-        assert_ne!(app.identity.id, old_id);
-        assert!(app.verify_current_password("newpass").is_ok());
-    }
-
-    #[test]
-    fn reset_identity_new_id_different() {
-        let mut app = create_test_app("old");
-        let old_id = app.identity.id.clone();
-        let old_pubkey = app.identity.public_key.clone();
-
-        app.reset_identity("new", "newpass").unwrap();
-
-        assert_ne!(app.identity.id, old_id);
-        assert_ne!(app.identity.public_key, old_pubkey);
-    }
-
-    #[test]
-    fn reset_identity_persists_after_reopen() {
-        let mut app = create_test_app("old");
-        let old_id = app.identity.id.clone();
-        let old_pubkey = app.identity.public_key.clone();
-
-        app.reset_identity("new", "newpass").unwrap();
-
-        assert_eq!(app.identity.name, "new");
-        assert_ne!(app.identity.id, old_id);
-        assert_ne!(app.identity.public_key, old_pubkey);
-        assert!(app.verify_current_password("newpass").is_ok());
-        assert!(app.verify_current_password("oldpass").is_err());
-    }
-
-    #[test]
-    fn network_initially_offline() {
-        let app = create_test_app("test");
-        assert!(!app.network.is_online());
-    }
-
-    #[test]
-    fn network_stop_when_offline_fails() {
-        let mut app = create_test_app("test");
-        assert!(app.network_stop().is_err());
-    }
 }

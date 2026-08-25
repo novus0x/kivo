@@ -1,8 +1,9 @@
 use ed25519_dalek::SigningKey;
+use libp2p::{Multiaddr, PeerId};
 
 use crate::core::crypto;
 use crate::core::identity::Identity;
-use crate::network::node::NetworkNode;
+use crate::network::node::{ConnectedPeer, NetworkNode};
 use crate::storage::local::LocalStore;
 
 pub struct KivoApp {
@@ -61,5 +62,22 @@ impl KivoApp {
 
     pub fn network_stop(&mut self) -> Result<(), String> {
         self.network.stop()
+    }
+
+    pub fn network_connect(
+        &self,
+        address: Multiaddr,
+        expected_peer_id: PeerId,
+        kivo_id: String,
+    ) -> Result<(), String> {
+        self.network.dial(address, expected_peer_id, kivo_id)
+    }
+
+    pub fn network_listen_addresses(&self) -> Result<Vec<Multiaddr>, String> {
+        self.network.get_listen_addresses()
+    }
+
+    pub fn network_connected_peers(&self) -> Result<Vec<ConnectedPeer>, String> {
+        self.network.get_connected_peers()
     }
 }

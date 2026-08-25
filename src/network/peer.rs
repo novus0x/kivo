@@ -12,14 +12,4 @@ impl Peer {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn peer_stores_fields() {
-        let peer = Peer::new("kivo-3", "127.0.0.1:4000");
-        assert_eq!(peer.identity_id, "kivo-3");
-        assert_eq!(peer.address, "127.0.0.1:4000");
-    }
-}

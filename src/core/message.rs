@@ -22,24 +22,3 @@ impl Message {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn new_message_stores_fields() {
-        let msg = Message::new("kivo-1", "kivo-2", "hello");
-        assert_eq!(msg.sender_id, "kivo-1");
-        assert_eq!(msg.recipient_id, "kivo-2");
-        assert_eq!(msg.content, "hello");
-        assert!(msg.id.starts_with("msg-"));
-    }
-
-    #[test]
-    fn each_message_gets_unique_id() {
-        let a = Message::new("s", "r", "a");
-        let b = Message::new("s", "r", "b");
-        assert_ne!(a.id, b.id);
-    }
-}

@@ -155,6 +155,14 @@ Kivo currently stores its local state at:
 
 The database is created automatically when needed.
 
+An alternative data directory can be specified with `--data-dir`:
+
+```bash
+cargo run -- --data-dir /tmp/kivo-a
+```
+
+This creates the database at `/tmp/kivo-a/kivo.db` instead. Each data directory is independent and contains its own identity.
+
 Current persistent identity data includes:
 
 * username
@@ -280,6 +288,13 @@ One-shot commands are also available:
 cargo run -- status
 cargo run -- version
 cargo run -- help
+```
+
+The `--data-dir` flag can be combined with any command:
+
+```bash
+cargo run -- --data-dir /tmp/kivo-a status
+cargo run -- --data-dir /tmp/kivo-a version
 ```
 
 The `reset identity` command permanently deletes the current identity and all local data associated with it, then creates a new identity from scratch. It requires the current password and an explicit `RESET` confirmation. The replacement is transactional — if anything fails, the existing identity remains intact. If the network is running, it is stopped before the reset.
@@ -450,6 +465,24 @@ Run the application:
 ```bash
 cargo run
 ```
+
+### Running multiple local nodes
+
+Use `--data-dir` to run multiple independent Kivo nodes on the same machine. Each node has its own database and identity.
+
+Terminal A:
+
+```bash
+cargo run -- --data-dir /tmp/kivo-a
+```
+
+Terminal B:
+
+```bash
+cargo run -- --data-dir /tmp/kivo-b
+```
+
+Each instance creates its own `kivo.db` in the specified directory. The default `~/.kivo` is not affected. This is useful for testing peer-to-peer networking between two local nodes.
 
 Run checks:
 

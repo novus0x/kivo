@@ -15,5 +15,5 @@ ed25519-dalek = { version = "3", features = ["rand_core"] }
 chacha20poly1305 = "0.11"
 sha2 = "0.11"
 hex = "0.4"
-libp2p = { version = "0.56", features = ["quic", "ed25519", "tokio"] }
+libp2p = { version = "0.56", features = ["quic", "ed25519", "tokio", "ping"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

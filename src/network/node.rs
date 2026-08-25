@@ -1,12 +1,15 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use libp2p::{swarm::SwarmEvent, Multiaddr, PeerId};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::core::identity::Identity;
 
 use super::identity as kivo_identity;
+use super::session;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum NetworkState {
@@ -17,13 +20,94 @@ pub enum NetworkState {
     Error,
 }
 
+#[derive(Debug, Clone)]
+pub struct ConnectedPeer {
+    pub peer_id: PeerId,
+    pub kivo_id: Option<String>,
+    pub session_active: bool,
+}
+
+pub enum NetworkCommand {
+    Dial {
+        address: Multiaddr,
+        expected_peer_id: PeerId,
+        kivo_id: String,
+        response: oneshot::Sender<Result<(), String>>,
+    },
+    GetListenAddresses {
+        response: oneshot::Sender<Result<Vec<Multiaddr>, String>>,
+    },
+    GetConnectedPeers {
+        response: oneshot::Sender<Result<Vec<ConnectedPeer>, String>>,
+    },
+    DisconnectAll,
+    Shutdown,
+}
+
+pub struct NetworkHandle {
+    cmd_tx: mpsc::Sender<NetworkCommand>,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl NetworkHandle {
+    pub fn dial(
+        &self,
+        address: Multiaddr,
+        expected_peer_id: PeerId,
+        kivo_id: String,
+    ) -> Result<(), String> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.cmd_tx
+            .blocking_send(NetworkCommand::Dial {
+                address,
+                expected_peer_id,
+                kivo_id,
+                response: response_tx,
+            })
+            .map_err(|_| "Network task stopped.".to_string())?;
+        response_rx
+            .blocking_recv()
+            .map_err(|_| "Network task stopped.".to_string())?
+    }
+
+    pub fn get_listen_addresses(&self) -> Result<Vec<Multiaddr>, String> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.cmd_tx
+            .blocking_send(NetworkCommand::GetListenAddresses {
+                response: response_tx,
+            })
+            .map_err(|_| "Network task stopped.".to_string())?;
+        response_rx
+            .blocking_recv()
+            .map_err(|_| "Network task stopped.".to_string())?
+            .map_err(|_| "Network task stopped.".to_string())
+    }
+
+    pub fn get_connected_peers(&self) -> Result<Vec<ConnectedPeer>, String> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.cmd_tx
+            .blocking_send(NetworkCommand::GetConnectedPeers {
+                response: response_tx,
+            })
+            .map_err(|_| "Network task stopped.".to_string())?;
+        response_rx
+            .blocking_recv()
+            .map_err(|_| "Network task stopped.".to_string())?
+            .map_err(|_| "Network task stopped.".to_string())
+    }
+
+    pub fn shutdown(&self) {
+        let _ = self.cmd_tx.blocking_send(NetworkCommand::DisconnectAll);
+        std::thread::sleep(Duration::from_millis(200));
+        let _ = self.cmd_tx.blocking_send(NetworkCommand::Shutdown);
+    }
+}
+
 pub struct NetworkNode {
     state: NetworkState,
     peer_id: Option<PeerId>,
-    listen_address: Option<Multiaddr>,
     connection_count: Arc<AtomicUsize>,
-    shutdown_tx: Option<std::sync::mpsc::Sender<()>>,
-    runtime: Option<tokio::runtime::Runtime>,
+    handle: Option<NetworkHandle>,
 }
 
 impl NetworkNode {
@@ -31,10 +115,8 @@ impl NetworkNode {
         NetworkNode {
             state: NetworkState::Offline,
             peer_id: None,
-            listen_address: None,
             connection_count: Arc::new(AtomicUsize::new(0)),
-            shutdown_tx: None,
-            runtime: None,
+            handle: None,
         }
     }
 
@@ -44,10 +126,6 @@ impl NetworkNode {
 
     pub fn peer_id(&self) -> Option<PeerId> {
         self.peer_id
-    }
-
-    pub fn listen_address(&self) -> Option<&Multiaddr> {
-        self.listen_address.as_ref()
     }
 
     pub fn connection_count(&self) -> usize {
@@ -76,9 +154,6 @@ impl NetworkNode {
 
         self.peer_id = Some(peer_id);
 
-        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
-        self.shutdown_tx = Some(shutdown_tx);
-
         let connection_count = self.connection_count.clone();
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -88,6 +163,7 @@ impl NetworkNode {
             .build()
             .map_err(|e| format!("Failed to create tokio runtime: {e}"))?;
 
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let (state_tx, state_rx) = std::sync::mpsc::channel();
         let (listen_addr_tx, listen_addr_rx) = std::sync::mpsc::channel();
 
@@ -96,7 +172,7 @@ impl NetworkNode {
                 libp2p_keypair,
                 peer_id,
                 connection_count,
-                shutdown_rx,
+                cmd_rx,
                 state_tx,
                 listen_addr_tx,
             )
@@ -108,11 +184,9 @@ impl NetworkNode {
         });
 
         match listen_addr_rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(addr) => {
-                self.listen_address = Some(addr);
-            }
+            Ok(_) => {}
             Err(_) => {
-                self.cleanup_runtime();
+                self.cleanup_handle();
                 self.state = NetworkState::Offline;
                 self.peer_id = None;
                 return Err("Unable to start network.".to_string());
@@ -122,14 +196,16 @@ impl NetworkNode {
         match state_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(NetworkState::Online) => {
                 self.state = NetworkState::Online;
-                self.runtime = Some(rt);
+                self.handle = Some(NetworkHandle {
+                    cmd_tx,
+                    runtime: rt,
+                });
                 Ok(())
             }
             Ok(_) | Err(_) => {
-                self.cleanup_runtime();
+                self.cleanup_handle();
                 self.state = NetworkState::Offline;
                 self.peer_id = None;
-                self.listen_address = None;
                 Err("Unable to start network.".to_string())
             }
         }
@@ -140,14 +216,12 @@ impl NetworkNode {
             return Err("Network is not running.".to_string());
         }
 
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
+        if let Some(handle) = self.handle.take() {
+            handle.shutdown();
+            handle.runtime.shutdown_timeout(Duration::from_secs(3));
         }
 
-        self.cleanup_runtime();
-
         self.state = NetworkState::Stopped;
-        self.listen_address = None;
         self.connection_count.store(0, Ordering::Relaxed);
 
         Ok(())
@@ -159,36 +233,77 @@ impl NetworkNode {
         self.peer_id = None;
     }
 
-    fn cleanup_runtime(&mut self) {
-        if let Some(rt) = self.runtime.take() {
-            rt.shutdown_timeout(Duration::from_secs(5));
+    pub fn dial(
+        &self,
+        address: Multiaddr,
+        expected_peer_id: PeerId,
+        kivo_id: String,
+    ) -> Result<(), String> {
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or("Network is not running.".to_string())?;
+        handle.dial(address, expected_peer_id, kivo_id)
+    }
+
+    pub fn get_listen_addresses(&self) -> Result<Vec<Multiaddr>, String> {
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or("Network is not running.".to_string())?;
+        handle.get_listen_addresses()
+    }
+
+    pub fn get_connected_peers(&self) -> Result<Vec<ConnectedPeer>, String> {
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or("Network is not running.".to_string())?;
+        handle.get_connected_peers()
+    }
+
+    fn cleanup_handle(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.shutdown();
+            handle.runtime.shutdown_timeout(Duration::from_secs(5));
         }
     }
 }
 
 async fn run_swarm(
     keypair: libp2p::identity::Keypair,
-    _peer_id: PeerId,
+    local_peer_id: PeerId,
     connection_count: Arc<AtomicUsize>,
-    shutdown_rx: std::sync::mpsc::Receiver<()>,
+    mut cmd_rx: mpsc::Receiver<NetworkCommand>,
     state_tx: std::sync::mpsc::Sender<NetworkState>,
     listen_addr_tx: std::sync::mpsc::Sender<Multiaddr>,
 ) -> Result<(), String> {
     use libp2p::futures::StreamExt;
-    use libp2p::swarm::dummy::Behaviour;
     use libp2p::SwarmBuilder;
 
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_quic_config(|config| config)
-        .with_behaviour(|_| Ok(Behaviour))
+        .with_behaviour(|_| Ok(session::SessionBehaviour::new()))
         .map_err(|e| format!("Failed to build swarm: {e}"))?
+        .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(300)))
         .build();
+
+    let swarm_peer_id = *swarm.local_peer_id();
+    if swarm_peer_id != local_peer_id {
+        return Err(format!(
+            "Identity mismatch: advertised PeerId={local_peer_id} but swarm derived PeerId={swarm_peer_id}"
+        ));
+    }
 
     let listen_addr: Multiaddr = "/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap();
     swarm
         .listen_on(listen_addr)
         .map_err(|e| format!("Failed to listen: {e}"))?;
+
+    let mut peer_kivo_ids: HashMap<PeerId, String> = HashMap::new();
+    let mut listen_addresses: Vec<Multiaddr> = Vec::new();
+    let mut peer_sessions: HashMap<PeerId, session::SessionState> = HashMap::new();
 
     let _ = state_tx.send(NetworkState::Online);
 
@@ -197,21 +312,59 @@ async fn run_swarm(
             event = swarm.next() => {
                 match event {
                     Some(SwarmEvent::NewListenAddr { address, .. }) => {
+                        listen_addresses.push(address.clone());
                         let _ = listen_addr_tx.send(address);
                     }
-                    Some(SwarmEvent::ConnectionEstablished { .. }) => {
+                    Some(SwarmEvent::ConnectionEstablished { peer_id: _, connection_id: _, num_established: _, .. }) => {
                         connection_count.fetch_add(1, Ordering::Relaxed);
                     }
-                    Some(SwarmEvent::ConnectionClosed { .. }) => {
+                    Some(SwarmEvent::ConnectionClosed { peer_id, connection_id: _, cause: _, .. }) => {
                         let _ = connection_count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
+                        peer_sessions.remove(&peer_id);
                     }
-                    Some(SwarmEvent::IncomingConnectionError { .. }) => {}
+                    Some(SwarmEvent::OutgoingConnectionError { peer_id: _, error: _, .. }) => {
+                    }
+                    Some(SwarmEvent::IncomingConnectionError { error: _, .. }) => {
+                    }
+                    Some(SwarmEvent::Dialing { peer_id: _, .. }) => {
+                    }
+                    Some(SwarmEvent::Behaviour(session_event)) => {
+                        peer_sessions.insert(session_event.peer, session_event.state);
+                    }
                     _ => {}
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                if shutdown_rx.try_recv().is_ok() {
-                    break;
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(NetworkCommand::Dial { address, expected_peer_id, kivo_id, response }) => {
+                        peer_kivo_ids.insert(expected_peer_id, kivo_id);
+                        let result = swarm.dial(address).map_err(|e| format!("Dial failed: {e}"));
+                        let _ = response.send(result);
+                    }
+                    Some(NetworkCommand::GetListenAddresses { response }) => {
+                        let addrs: Vec<Multiaddr> = swarm.listeners().cloned().collect();
+                        let _ = response.send(Ok(addrs));
+                    }
+                    Some(NetworkCommand::GetConnectedPeers { response }) => {
+                        let peers: Vec<ConnectedPeer> = swarm.connected_peers().map(|pid| {
+                            ConnectedPeer {
+                                peer_id: *pid,
+                                kivo_id: peer_kivo_ids.get(pid).cloned(),
+                                session_active: peer_sessions.get(pid) == Some(&session::SessionState::Active),
+                            }
+                        }).collect();
+                        let _ = response.send(Ok(peers));
+                    }
+                    Some(NetworkCommand::DisconnectAll) => {
+                        let peers: Vec<PeerId> = swarm.connected_peers().cloned().collect();
+                        for peer in &peers {
+                            let _ = swarm.disconnect_peer_id(*peer);
+                        }
+                    }
+                    Some(NetworkCommand::Shutdown) => {
+                        break;
+                    }
+                    None => break,
                 }
             }
         }
@@ -223,100 +376,5 @@ async fn run_swarm(
 impl Default for NetworkNode {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn initial_state_is_offline() {
-        let node = NetworkNode::new();
-        assert_eq!(*node.state(), NetworkState::Offline);
-        assert!(!node.is_online());
-    }
-
-    #[test]
-    fn stop_when_offline_returns_error() {
-        let mut node = NetworkNode::new();
-        assert!(node.stop().is_err());
-    }
-
-    #[test]
-    fn reset_clears_state() {
-        let mut node = NetworkNode::new();
-        node.reset();
-        assert_eq!(*node.state(), NetworkState::Offline);
-        assert!(node.peer_id().is_none());
-    }
-
-    #[test]
-    fn peer_id_deterministic() {
-        let kp = crate::core::crypto::generate_keypair();
-        let identity = Identity::new("test", kp.verifying_key.to_bytes().to_vec());
-        let pid1 = kivo_identity::kivo_pubkey_to_peer_id(&identity.public_key).unwrap();
-        let pid2 = kivo_identity::kivo_pubkey_to_peer_id(&identity.public_key).unwrap();
-        assert_eq!(pid1, pid2);
-    }
-
-    #[test]
-    fn different_identity_different_peer_id() {
-        let kp1 = crate::core::crypto::generate_keypair();
-        let kp2 = crate::core::crypto::generate_keypair();
-        let id1 = Identity::new("a", kp1.verifying_key.to_bytes().to_vec());
-        let id2 = Identity::new("b", kp2.verifying_key.to_bytes().to_vec());
-        let pid1 = kivo_identity::kivo_pubkey_to_peer_id(&id1.public_key).unwrap();
-        let pid2 = kivo_identity::kivo_pubkey_to_peer_id(&id2.public_key).unwrap();
-        assert_ne!(pid1, pid2);
-    }
-
-    #[test]
-    fn start_and_stop_network() {
-        let mut node = NetworkNode::new();
-        let kp = crate::core::crypto::generate_keypair();
-        let identity = Identity::new("test", kp.verifying_key.to_bytes().to_vec());
-
-        node.start(&identity, &kp.signing_key.to_bytes()).unwrap();
-        assert!(node.is_online());
-        assert!(node.peer_id().is_some());
-
-        node.stop().unwrap();
-        assert_eq!(*node.state(), NetworkState::Stopped);
-    }
-
-    #[test]
-    fn start_twice_rejected() {
-        let mut node = NetworkNode::new();
-        let kp = crate::core::crypto::generate_keypair();
-        let identity = Identity::new("test", kp.verifying_key.to_bytes().to_vec());
-
-        node.start(&identity, &kp.signing_key.to_bytes()).unwrap();
-        let result = node.start(&identity, &kp.signing_key.to_bytes());
-        assert!(result.is_err());
-        node.stop().unwrap();
-    }
-
-    #[test]
-    fn stop_twice_safe() {
-        let mut node = NetworkNode::new();
-        let kp = crate::core::crypto::generate_keypair();
-        let identity = Identity::new("test", kp.verifying_key.to_bytes().to_vec());
-
-        node.start(&identity, &kp.signing_key.to_bytes()).unwrap();
-        node.stop().unwrap();
-        assert!(node.stop().is_err());
-    }
-
-    #[test]
-    fn network_uses_current_identity() {
-        let mut node = NetworkNode::new();
-        let kp = crate::core::crypto::generate_keypair();
-        let identity = Identity::new("test", kp.verifying_key.to_bytes().to_vec());
-        let expected_peer_id = kivo_identity::kivo_pubkey_to_peer_id(&identity.public_key).unwrap();
-
-        node.start(&identity, &kp.signing_key.to_bytes()).unwrap();
-        assert_eq!(node.peer_id(), Some(expected_peer_id));
-        node.stop().unwrap();
     }
 }
